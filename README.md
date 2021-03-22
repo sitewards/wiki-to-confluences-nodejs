@@ -20,4 +20,10 @@ In fact converstion goes like
 * namespaced pages, like user-pages, e.g.: `User:Agent.smith`
 * links in secion headers
 * image formatting, all images become fixed width previews
-* <I assume a lot of other things which were not tested>
+* ...I assume a lot of other things which were not tested
+
+## How to run
+
+1. Copy `.env.dist` to `.env` and feed in your wiki and confluence base URLs and your credentials, please don't add trailing slashes to URLs.
+2. Run `make wiki.install`
+3. Run `make wiki.sync`
