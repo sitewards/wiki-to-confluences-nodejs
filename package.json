@@ -13,6 +13,8 @@
     "tough-cookie": "*",
     "axios-cookiejar-support": "*",
     "request": "*",
-    "querystring": "*"
+    "querystring": "*",
+    "nodejs-file-downloader": "*",
+    "retry-axios": "*"
   }
 }

@@ -7,11 +7,16 @@ const fs                    = require('fs');
 const path                  = require('path');
 const querystring           = require('querystring');
 const FormData              = require('form-data');
+const Downloader            = require('nodejs-file-downloader');
+const rax                   = require('retry-axios');
 
 const PAGE_SIZE      = 100; // WARNING, jira cloud seem to have it hardcoded as 100
 const VERBOSE_OUTPUT = 1;
 
-const DELETE_EXISTING_PAGES = 0;
+// https://www.mediawiki.org/wiki/Manual:Namespace
+const PAGE_NAMESPACES_TO_SYNC = [0];
+
+const DELETE_EXISTING_PAGES = 1;
 
 const TARGET_AUTH = {
     username: process.env.TARGET_CONFLUENCE_USER,
@@ -29,6 +34,14 @@ let logError = console.error;
 
 const axiosInstance = axios.create({
     timeout: 1000,
+    raxConfig: {
+        retry: 5, // number of retry when facing 4xx or 5xx
+        noResponseRetries: 5, // number of retry when facing connection error
+        onRetryAttempt: err => {
+            const cfg = rax.getConfig(err);
+            console.log(`Retry attempt #${cfg.currentRetryAttempt}`); // track current trial
+        },
+    },
     httpAgent: new http.Agent({keepAlive: true}),
     httpsAgent: new https.Agent({keepAlive: true}),
     jar: new tough.CookieJar()
@@ -73,7 +86,7 @@ async function login(startAt, maxResults) {
     });
 }
 
-async function getAllPagesPage(startAt, maxResults) {
+async function getAllPagesByNamespace(startAt, maxResults, namespaceIndex) {
     return axiosInstance.request({
         method: 'GET',
         url: process.env.SOURCE_WIKI_BASE_URL + '/api.php',
@@ -81,6 +94,7 @@ async function getAllPagesPage(startAt, maxResults) {
             action: 'query',
             list: 'allpages',
             format: 'json',
+            apnamespace: namespaceIndex,
             aplimit: maxResults,
             apfrom: startAt
         },
@@ -93,15 +107,19 @@ async function getAllPages() {
     let proceedFrom = '';
     let allItems    = [];
     let count       = 0;
+    let i           = 0;
 
-    do {
-        let allItemsPage = await getAllPagesPage(proceedFrom, PAGE_SIZE);
-        allItems         = allItems.concat(allItemsPage.data.query.allpages);
-        if (typeof allItemsPage.data.continue === 'undefined') {
-            break;
-        }
-        proceedFrom = allItemsPage.data.continue.apcontinue;
-    } while (count++ < 1000);
+    for (i = 0; i < PAGE_NAMESPACES_TO_SYNC.length; i++) {
+        do {
+            let allItemsPage = await getAllPagesByNamespace(proceedFrom, PAGE_SIZE, PAGE_NAMESPACES_TO_SYNC[i]);
+            allItems         = allItems.concat(allItemsPage.data.query.allpages);
+            if (typeof allItemsPage.data.continue === 'undefined') {
+                break;
+            }
+            proceedFrom = allItemsPage.data.continue.apcontinue;
+        } while (count++ < 1000);
+    }
+
 
     return allItems;
 }
@@ -163,7 +181,7 @@ async function getPageImages(pageId, pageTitle) {
             imlimit: 100,
         },
     }).catch(function (error) {
-        logError(error);
+        logError('getPageImages', pageTitle, error.response.data);
     });
 
 
@@ -220,27 +238,32 @@ async function getImageURL(imageTitle) {
 }
 
 async function wikiWikiToHtml(wikiText) {
-    let result = await axiosInstance.request({
-        method: 'POST',
-        url: process.env.SOURCE_WIKI_BASE_URL + '/api.php',
-        data: querystring.stringify({
-            action: 'parse',
-            format: 'json',
-            text: wikiText,
-            disabletoc: true,
-            disableeditsection: true,
-            wrapoutputclass: false
-        })
-    }).catch(function (error) {
-        logError(error);
-    });
 
-    return result.data.parse.text['*'];
+    try {
+        let result = await axiosInstance.request({
+            method: 'POST',
+            url: process.env.SOURCE_WIKI_BASE_URL + '/api.php',
+            data: querystring.stringify({
+                action: 'parse',
+                format: 'json',
+                text: wikiText,
+                disabletoc: true,
+                disableeditsection: true,
+                wrapoutputclass: false,
+            }),
+        });
+
+        return result.data.parse.text['*'];
+    } catch (err) {
+        // Handle Error Here
+        console.error(err);
+    }
+
 }
 
 
 async function getConfluencePage(title) {
-    return axios({
+    let result = await axiosInstance.request({
         method: 'GET',
         url: process.env.TARGET_CONFLUENCE_BASE_URL + '/wiki/rest/api/content',
         params: {
@@ -251,8 +274,9 @@ async function getConfluencePage(title) {
         },
         auth: TARGET_AUTH,
     }).catch(function (error) {
-        logError('getConfluencePage', title, error.response.data);
+        logError('getConfluencePage', title, error);
     });
+    return result;
 }
 
 async function createConfluencePage(title, content, tags = []) {
@@ -260,7 +284,7 @@ async function createConfluencePage(title, content, tags = []) {
         return {name: item};
     });
 
-    return axios({
+    let result = await axiosInstance.request({
         method: 'POST',
         url: process.env.TARGET_CONFLUENCE_BASE_URL + '/wiki/rest/api/content',
         data: {
@@ -284,6 +308,7 @@ async function createConfluencePage(title, content, tags = []) {
     }).catch(function (error) {
         logError('createConfluencePage', title, error.response.data);
     });
+    return result;
 }
 
 async function deleteConfluencePage(pageId) {
@@ -291,13 +316,13 @@ async function deleteConfluencePage(pageId) {
         return;
     }
 
-    return axios({
+    return await axiosInstance.request({
         method: 'DELETE',
         url: process.env.TARGET_CONFLUENCE_BASE_URL + '/wiki/rest/api/content/' + pageId,
-        data: {
+        params: {
             "space": {
                 "key": process.env.TARGET_CONFLUENCE_SPACE_NAME
-            },
+            }
         },
         auth: TARGET_AUTH,
     }).catch(function (error) {
@@ -325,8 +350,10 @@ async function postConfluenceAttachment(pageId, remoteFileName, localFilePath) {
     });
     form.append('comment', 'migrated from wiki.sitewards.net');
 
-    return axios.put(process.env.TARGET_CONFLUENCE_BASE_URL + '/wiki/rest/api/content/' + pageId + '/child/attachment', form, {
+    return axiosInstance.put(process.env.TARGET_CONFLUENCE_BASE_URL + '/wiki/rest/api/content/' + pageId + '/child/attachment', form, {
         headers: form.getHeaders(),
+        maxContentLength: Infinity,
+        maxBodyLength: Infinity,
         auth: TARGET_AUTH
     }).catch(error => {
         // Handle result…
@@ -383,7 +410,7 @@ function escapeWikiLinks(wikiText) {
         }
 
         if (p1.indexOf('File') === 0) {
-            return match.replace(/\[\[((File\:([^\]]+?))\.([a-z0-9]+))(\|[^\]]+?)?\]\]/gi, 'WIKI_FILE_TOKEN_START$3.$4WIKI_FILE_TOKEN_END');
+            return match.replace(/\[\[((\s?File\:([^\]]+?))\.([a-z0-9]+))(\|[^\]]+?)?\]\]/gi, 'WIKI_FILE_TOKEN_START$3.$4WIKI_FILE_TOKEN_END');
         }
 
         return 'WIKI_LINK_TOKEN_START' + p1 + '^^^' + p3 + 'WIKI_LINK_TOKEN_END';
@@ -460,24 +487,20 @@ function confluencePageIsUntouched(htmlText) {
 }
 
 async function pDownload(url, dest) {
-    var file = fs.createWriteStream(dest);
-    return new Promise((resolve, reject) => {
-        var responseSent = false; // flag to make sure that response is sent only once.
-        https.get(url, response => {
-            response.pipe(file);
-            file.on('finish', () => {
-                file.close(() => {
-                    if (responseSent) return;
-                    responseSent = true;
-                    resolve();
-                });
-            });
-        }).on('error', err => {
-            if (responseSent) return;
-            responseSent = true;
-            reject(err);
-        });
-    });
+    const downloader = new Downloader({
+        url: url,
+        directory: "/tmp",
+        maxAttempts:3,//Default is 1.
+        onError:function(error){//You can also hook into each failed attempt.
+            console.log('Error from attempt ',error)
+        }
+    })
+
+    try {
+        await downloader.download();
+    } catch (error) {//If all attempts fail, the last error is thrown.
+        console.log('Final fail',error)
+    }
 }
 
 async function syncWiki() {
@@ -538,15 +561,22 @@ async function syncWiki() {
         console.log('    transferring files');
 
         for (let fileIndex in sourcePageImages) {
-            let fileItem      = sourcePageImages[fileIndex];
-            let fileBasename  = path.basename(fileItem.url);
-            let localFilename = '/tmp/' + fileBasename;
-            console.log('        processing ' + fileItem.url);
 
-            await pDownload(fileItem.url, localFilename);
-            console.log('            downloaded');
-            await postConfluenceAttachment(confluencePageId, fileItem.title.replace(/^File:/g, ''), localFilename);
-            console.log('            uploaded');
+            let fileItem = sourcePageImages[fileIndex];
+            if (typeof fileItem.url === 'string') {
+                console.log('        processing ' + fileItem.url);
+
+                let fileBasename  = path.basename(fileItem.url);
+                let localFilename = '/tmp/' + fileBasename;
+                let localDirName = '/tmp/' + fileBasename;
+
+                await pDownload(fileItem.url, localDirName);
+
+                await postConfluenceAttachment(confluencePageId, fileItem.title.replace(/^File:/g, ''), localFilename);
+
+                console.log('            uploaded');
+            }
+
         }
 
         console.log('        done');
